@@ -1,0 +1,150 @@
+CREATE OR REPLACE TRANSIENT TABLE SANDBOX_DB.USER_TB.JLEE_ML_BANKRUPTCIES_ACCOUNT_DRIVER AS (
+  SELECT
+    current_date as filing_date
+    , ACCT_CUR.tsys_account_id as case_id
+    , acct_cur.status_code_chargeoff as chapter
+    , '' as poc_date
+    , concat(cust_cur.first_name,' ',cust_cur.middle_name,' ',cust_cur.last_name) as primary_name -- ask AIS for naming conventions. Can we send them a first name and a last name column?
+    , cust_cur.ssn_token as P_SSN
+    , '' as joint_debtor_name
+    , '' as joint_debtor_ssn
+    , ACCT_CUR.tsys_account_id as acct_number_1
+    -- , 16 digit PAN as acct_number_2
+    -- , 16 digit PAN as client_reference_number
+    -- , uniform_identifier (this can be left blank)
+    , FIN.total_balance as total_claim_amount
+    , FIN.interest_balance as interest
+    , FIN.fee_balance as fees
+    , acct_cur.account_open_date as open_date
+    , 'True' as file_claim
+    , '' as comments
+    , 'Primary' as debtor_claim_assignment
+    , 'TAB' as original_creditor
+    , 'MISSION LANE' as creditor_of_last_transaction
+    , transact.last_transaction_date as last_transaction_date
+    , pmt.last_payment_date as last_payment_date
+    , chrgof.chargeoff_complete_date as charge_off_date
+    , 'Joshua Lee' as creditor_employee_name
+    , add.street_1 as primary_debtor_address
+    , add.city as primary_debtor_city
+    , add.state as primary_debtor_state
+    , add.zip as primary_debtor_zip
+    , '' as joint_debtor_address
+    , '' as joint_debtor_city
+    , '' as joint_debtor_state
+    , '' as joint_debtor_zip
+    , '' as secured_amount
+    , '' as arrearage_amount
+    , '' as nature_of_property
+    , '' as property_description
+    , '' as value_of_property
+    , '' as basis_for_perfection
+    , purchase_apr_pct as annual_interest_rate
+    , 'Fixed' as annual_interest_type
+  FROM (
+    SELECT
+      *
+    FROM edw_db.public.tsys_account_cur AS acct
+    WHERE acct.application_suffix = 0
+    and status_code_chargeoff in ('07','13')
+  ) AS acct_cur
+  LEFT JOIN edw_db.public.customer_account_relationship_cur AS ecs_cur
+    ON acct_cur.tsys_account_id = ecs_cur.external_account_id
+  LEFT JOIN edw_db.public.customers_cur AS cust_cur
+    ON ecs_cur.customer_id = cust_cur.customer_id 
+  LEFT JOIN edw_db.public.tsys_account_chargeoff_cur AS chrgof
+    ON acct_cur.tsys_account_id = chrgof.tsys_account_id
+    AND acct_cur.application_suffix = chrgof.application_suffix
+  LEFT JOIN (SELECT a.tsys_account_id, a.application_suffix, a.balance_current AS total_balance
+      , SUM(
+          CASE
+            WHEN b.classification_code IN ('PR','CA') THEN b.amount_current_out + b.amount_cycle1p_out
+            ELSE 0
+          END
+        ) AS principal_balance
+      , SUM(
+          CASE
+            WHEN b.classification_code IN ('FE') THEN b.amount_current_out + b.amount_cycle1p_out
+            ELSE 0
+          END
+        ) AS fee_balance
+      , SUM(b.amount_financial_charge_out) AS interest_balance
+    FROM edw_db.public.tsys_account_details_cur AS a
+    LEFT JOIN edw_db.public.tsys_account_transaction_category_details_cur AS b
+      ON a.tsys_account_id = b.tsys_account_id
+      AND a.application_suffix = b.application_suffix
+    WHERE a.application_suffix = 0
+    GROUP BY ALL) FIN
+    ON acct_cur.tsys_account_id = FIN.TSYS_ACCOUNT_ID
+    and acct_cur.application_suffix = fin.application_suffix
+  LEFT JOIN (SELECT TSYS_ACCOUNT_ID, MAX(DATE_TRANSACTION) AS last_transaction_date from edw_db.public.tsys_account_transaction_information 
+    where transaction_category in (1,19) group by 1) transact
+    on acct_cur.tsys_account_id = transact.tsys_account_id
+  LEFT JOIN (SELECT TSYS_ACCOUNT_ID, MAX(PMT_DT) AS last_payment_date from sandbox_db.user_tb.bk_payments group by 1) PMT
+    ON acct_cur.tsys_account_id = pmt.tsys_account_id
+  LEFT JOIN EDW_DB.PUBLIC.CUSTOMER_ADDRESSES_CUR ADD
+    ON ecs_cur.customer_id = ADD.customer_id
+  LEFT JOIN edw_db.public.account_statements AS stmt
+    ON acct_cur.tsys_account_id = stmt.external_account_id
+    AND stmt.statement_end_dt < charge_off_date --Look at statements before charge off (terms update at charge off and change APR)
+  WHERE charge_off_date >= '2024-01-01'
+  QUALIFY ROW_NUMBER() OVER(PARTITION BY acct_cur.tsys_account_id ORDER BY stmt.statement_end_dt DESC) = 1 --Newest stateme
+  )
+;
+
+CREATE OR REPLACE TABLE sandbox_db.user_tb.bk_payments AS (
+--FIS logic--
+  SELECT
+    'FIS' AS sor
+    , a.card_id AS tsys_account_id
+    , a.user_id AS ecs_customer_id
+    , CASE WHEN NVL(a.fis_block_code,'#')||NVL(a.fis_reclass_code,'#') = '#C' THEN 'Collections'
+        WHEN NVL(a.fis_block_code,'#')||NVL(a.fis_reclass_code,'#') IN ('B0','B3') THEN 'Recoveries'
+        ELSE 'Other' END AS acct_type
+    , a.fis_tran_dt::DATE AS pmt_dt
+    , a.fis_header_post_date::DATE AS pmt_posting_dt
+    , NVL(a.fis_tran_amount,0)::DECIMAL(10,2) AS pmt_amt
+    , b.fis_header_post_date::DATE AS return_posting_dt
+    , NVL(b.fis_tran_amount,0)::DECIMAL(10,2) AS return_amt
+    , pmt_amt - return_amt AS net_amt
+  FROM (SELECT * FROM edw_db.public.card_batched_transaction_data WHERE fis_tran_code = 65) AS a --Payments
+  LEFT JOIN (SELECT * FROM edw_db.public.card_batched_transaction_data WHERE fis_tran_code = 85) AS b --Returned payments
+    ON a.card_id = b.card_id
+    AND a.fis_tran_dt::DATE = b.fis_tran_dt::DATE
+    AND a.fis_tran_amount::DECIMAL(10,2) = b.fis_tran_amount::DECIMAL(10,2)
+  WHERE (a.fis_header_post_date IS NULL --Some really old payments don't have a header post date
+    OR a.fis_header_post_date::DATE <= '2021-09-16') --Last day of processing on FIS
+UNION
+--TSYS logic--
+  SELECT
+    'TSYS' AS sor
+    , a.tsys_account_id
+    , ecs_customer.customer_id AS ecs_customer_id
+    , CASE WHEN TRIM(c.status_code_chargeoff) IN ('BD','ST') THEN 'Recoveries'
+        WHEN (TRIM(c.status_code_chargeoff) = '' AND TRIM(c.status_code_current_past_due) IN ('01','02','03','04','05','06')) THEN 'Collections'
+        ELSE 'Other' END AS acct_type
+    , a.date_transaction::DATE AS pmt_dt
+    , a.date_post::DATE AS pmt_posting_dt
+    , NVL(a.amount_transaction,0)::DECIMAL(10,2) AS pmt_amt
+    , b.date_post::DATE AS return_posting_dt
+    , NVL(b.amount_transaction,0)::DECIMAL(10,2) AS return_amt
+    , pmt_amt - return_amt AS net_amt
+  FROM (SELECT * FROM edw_db.public.tsys_account_transaction_information WHERE transaction_code IN (108,1018)) AS a --Payments
+  LEFT JOIN (SELECT * FROM edw_db.public.tsys_account_transaction_information WHERE transaction_code IN (139,150,747,748)) AS b --Returned payments
+    ON a.tsys_account_id = b.tsys_account_id
+    AND a.date_transaction::DATE = b.date_transaction::DATE
+    AND a.amount_transaction::DECIMAL(10,2) = b.amount_transaction::DECIMAL(10,2)
+  LEFT JOIN edw_db.public.tsys_account_to_customer_relationship_cur AS act_to_customer
+    ON a.tsys_account_id = act_to_customer.tsys_account_id
+    AND a.application_suffix = act_to_customer.application_suffix
+    AND act_to_customer.account_relationship_status != 'T'
+  LEFT JOIN edw_db.public.customer_account_relationship_cur AS ecs_customer
+    ON act_to_customer.tsys_account_id = ecs_customer.external_account_id
+    AND act_to_customer.tsys_customer_id = ecs_customer.external_customer_id
+  LEFT JOIN edw_db.public.tsys_account_pt AS c
+    ON a.tsys_account_id = c.tsys_account_id
+    AND a.application_suffix = c.application_suffix
+    AND a.date_post::DATE = c.snap_date::DATE+1 --Find account status day before posting date since cure payments would move account to current
+  WHERE a.date_post::DATE >= '2021-09-17' --Any processed transactions post-TSYS conversion
+  )
+;
