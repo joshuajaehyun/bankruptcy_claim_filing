@@ -1,0 +1,93 @@
+CREATE OR REPLACE TRANSIENT TABLE SANDBOX_DB.USER_TB.JLEE_ML_BANKRUPTCIES_ACCOUNT_DRIVER AS (
+  SELECT
+    current_date as filing_date
+    , ACCT_CUR.tsys_account_id as case_id
+    , acct_cur.status_code_chargeoff as chapter
+    , '' as poc_date
+    , concat(cust_cur.first_name,' ',cust_cur.middle_name,' ',cust_cur.last_name) as primary_name -- ask AIS for naming conventions. Can we send them a first name and a last name column?
+    , cust_cur.ssn_token as P_SSN
+    , '' as joint_debtor_name
+    , '' as joint_debtor_ssn
+    , acct_cur.tsys_account_id as acct_number_1
+    -- , 16 digit PAN as acct_number_2
+    -- , 16 digit PAN as client_reference_number
+    -- , uniform_identifier (this can be left blank)
+    , FIN.total_balance as total_claim_amount
+    , FIN.interest_balance as interest
+    , FIN.fee_balance as fees
+    , acct_cur.account_open_date as open_date
+    , 'True' as file_claim
+    , '' as comments
+    , 'Primary' as debtor_claim_assignment
+    , 'TAB' as original_creditor
+    , 'MISSION LANE' as creditor_of_last_transaction
+    , transact.last_transaction_date as last_transaction_date
+    , pmt.last_payment_date as last_payment_date  --- case when stmt for FIS vs TSYS
+    , chrgof.chargeoff_complete_date as charge_off_date
+    , 'Joshua Lee' as creditor_employee_name
+    , add.street_1 as primary_debtor_address
+    , add.city as primary_debtor_city
+    , add.state as primary_debtor_state
+    , add.zip as primary_debtor_zip
+    , '' as joint_debtor_address
+    , '' as joint_debtor_city
+    , '' as joint_debtor_state
+    , '' as joint_debtor_zip
+    , '' as secured_amount
+    , '' as arrearage_amount
+    , '' as nature_of_property
+    , '' as property_description
+    , '' as value_of_property
+    , '' as basis_for_perfection
+    , purchase_apr_pct as annual_interest_rate
+    , 'Fixed' as annual_interest_type
+  FROM (
+    SELECT
+      *
+    FROM edw_db.public.tsys_account_cur AS acct
+    WHERE acct.application_suffix = 0
+    and status_code_chargeoff in ('07','13')
+  ) AS acct_cur
+  LEFT JOIN edw_db.public.customer_account_relationship_cur AS ecs_cur
+    ON acct_cur.tsys_account_id = ecs_cur.external_account_id
+  LEFT JOIN edw_db.public.customers_cur AS cust_cur
+    ON ecs_cur.customer_id = cust_cur.customer_id 
+  LEFT JOIN edw_db.public.tsys_account_chargeoff_cur AS chrgof
+    ON acct_cur.tsys_account_id = chrgof.tsys_account_id
+    AND acct_cur.application_suffix = chrgof.application_suffix
+  LEFT JOIN (SELECT a.tsys_account_id, a.application_suffix, a.balance_current AS total_balance
+      , SUM(
+          CASE
+            WHEN b.classification_code IN ('PR','CA') THEN b.amount_current_out + b.amount_cycle1p_out
+            ELSE 0
+          END
+        ) AS principal_balance
+      , SUM(
+          CASE
+            WHEN b.classification_code IN ('FE') THEN b.amount_current_out + b.amount_cycle1p_out
+            ELSE 0
+          END
+        ) AS fee_balance
+      , SUM(b.amount_financial_charge_out) AS interest_balance
+    FROM edw_db.public.tsys_account_details_cur AS a
+    LEFT JOIN edw_db.public.tsys_account_transaction_category_details_cur AS b
+      ON a.tsys_account_id = b.tsys_account_id
+      AND a.application_suffix = b.application_suffix
+    WHERE a.application_suffix = 0
+    GROUP BY ALL) FIN
+    ON acct_cur.tsys_account_id = FIN.TSYS_ACCOUNT_ID
+    and acct_cur.application_suffix = fin.application_suffix
+  LEFT JOIN (SELECT TSYS_ACCOUNT_ID, MAX(DATE_TRANSACTION) AS last_transaction_date from edw_db.public.tsys_account_transaction_information 
+    where transaction_category in (1,19) group by 1) transact
+    on acct_cur.tsys_account_id = transact.tsys_account_id
+  LEFT JOIN (SELECT TSYS_ACCOUNT_ID, MAX(date_transaction) AS last_payment_date from edw_db.public.tsys_account_transaction_information where transaction_code IN (108,1018) group by 1) PMT
+    ON acct_cur.tsys_account_id = pmt.tsys_account_id
+  LEFT JOIN EDW_DB.PUBLIC.CUSTOMER_ADDRESSES_CUR ADD
+    ON ecs_cur.customer_id = ADD.customer_id
+  LEFT JOIN edw_db.public.account_statements AS stmt
+    ON acct_cur.tsys_account_id = stmt.external_account_id
+    AND stmt.statement_end_dt < charge_off_date --Look at statements before charge off (terms update at charge off and change APR)
+  WHERE charge_off_date >= '2024-01-01'
+  QUALIFY ROW_NUMBER() OVER(PARTITION BY acct_cur.tsys_account_id ORDER BY stmt.statement_end_dt DESC) = 1 --Newest stateme
+  )
+;
